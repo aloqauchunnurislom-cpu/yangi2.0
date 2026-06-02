@@ -1,7 +1,6 @@
 import os
 import re
 import logging
-import json
 import random
 import copy
 import asyncio
@@ -9,6 +8,8 @@ import threading
 from typing import Dict, List, Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
+
+from motor.motor_asyncio import AsyncIOMotorClient
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,47 +23,15 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # ----------------------------------------------------------
-# 0. DATABASE PATHS & PERSISTENCE WITH MIGRATION
+# 1. SOZLAMALAR VA BAZA (MongoDB)
 # ----------------------------------------------------------
-# Light Bot 2.0 o'zining data.json faylidan foydalanadi, lekin eski ma'lumotlar yo'qolmasligi uchun
-# ota-papkadagi data.json mavjud bo'lsa, avtomatik ravishda undan nusxa ko'chirib oladi.
-DATA_FILE = "data.json"
-PARENT_DATA_FILE = "../data.json"
-
-def migrate_and_load_data() -> dict:
-    # Mahalliy data.json yo'q bo'lsa va ota-papkalarda mavjud bo'lsa, ko'chirib olish
-    if not os.path.exists(DATA_FILE) and os.path.exists(PARENT_DATA_FILE):
-        try:
-            with open(PARENT_DATA_FILE, 'r', encoding='utf-8') as src:
-                data = json.load(src)
-            with open(DATA_FILE, 'w', encoding='utf-8') as dest:
-                json.dump(data, dest, ensure_ascii=False, indent=2)
-            logging.info("Eski data.json muvaffaqiyatli Light Bot 2.0 ga migratsiya qilindi.")
-        except Exception as e:
-            logging.error(f"Migratsiya jarayonida xato: {e}")
-
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-    return {}
-
-def save_data(data: dict):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-# ----------------------------------------------------------
-# 1. SOZLAMALAR VA DIZAYN ELEMENTLARI
-# ----------------------------------------------------------
-# .env faylini ota-papka yoki joriy papkadan yuklash
 if os.path.exists(".env"):
     load_dotenv(".env")
 elif os.path.exists("../.env"):
     load_dotenv("../.env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
 CHANNEL_ID = "@sharofiddinovnurislom"
 CHANNEL_URL = "https://t.me/sharofiddinovnurislom"
 
@@ -72,9 +41,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-raw_data = migrate_and_load_data()
-user_states: Dict[int, Any] = {int(k): v for k, v in raw_data.items()}
+# Baza ulanishlari
+db_client = None
+users_collection = None
+
+if MONGO_URI:
+    try:
+        db_client = AsyncIOMotorClient(MONGO_URI)
+        users_collection = db_client["light_bot_db"]["users"]
+        logger.info("MongoDB muvaffaqiyatli ulandi!")
+    except Exception as e:
+        logger.error(f"MongoDB ga ulanishda xato: {e}")
+else:
+    logger.warning("MONGO_URI topilmadi. Ma'lumotlar faqatgina xotirada saqlanadi (deployda o'chadi)!")
+
+# Vaqtinchalik (MongoDB yo'q bo'lsa)
+memory_states: Dict[int, Any] = {}
 group_quiz_states: Dict[int, Any] = {}  # chat_id -> guruh quiz holati
+
+async def get_user_state(user_id: int) -> Dict:
+    default_state = {
+        "groups": [],
+        "active_group_id": None,
+        "active_questions": [],
+        "current_index": 0,
+        "score": 0,
+        "is_active": False,
+        "current_msg_id": None,
+        "answered": False,
+        "draft_questions": [],
+        "draft_name": None,
+        "is_drafting": False,
+    }
+    
+    if users_collection is not None:
+        doc = await users_collection.find_one({"_id": user_id})
+        if doc:
+            # Agar bazada eski obyekt bo'lsa, yangi kerakli maydonlarni to'ldiramiz
+            for k, v in default_state.items():
+                if k not in doc:
+                    doc[k] = v
+            return doc
+        else:
+            doc = default_state.copy()
+            doc["_id"] = user_id
+            await users_collection.insert_one(doc)
+            return doc
+    else:
+        if user_id not in memory_states:
+            memory_states[user_id] = default_state.copy()
+        return memory_states[user_id]
+
+async def save_user_state(user_id: int, state: Dict):
+    if users_collection is not None:
+        state["_id"] = user_id
+        await users_collection.replace_one({"_id": user_id}, state, upsert=True)
+    else:
+        memory_states[user_id] = state
+
+def next_group_id(state: Dict) -> int:
+    groups = state.get("groups", [])
+    if not groups:
+        return 1
+    return max(g["id"] for g in groups) + 1
 
 # ----------------------------------------------------------
 # 2. REGEX (Kuchaytirilgan parser)
@@ -128,7 +157,6 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -
         return False
 
 async def require_subscription(user_id: int, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Obunani qattiq talab qiladi. Obuna bo'lmasa, faqat obuna bo'lish tugmasini ko'rsatadi."""
     is_subscribed = await check_subscription(user_id, context)
     if not is_subscribed:
         keyboard = [
@@ -149,7 +177,7 @@ async def require_subscription(user_id: int, chat_id: int, context: ContextTypes
     return True
 
 # ----------------------------------------------------------
-# 4. PARSER VA DRAFT STATE MANTIQLARI
+# 4. PARSER
 # ----------------------------------------------------------
 def parse_text_to_questions(text: str) -> List[Dict]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -172,43 +200,6 @@ def parse_text_to_questions(text: str) -> List[Dict]:
             "answer_letter": ans_letter
         })
     return questions
-
-def get_user_state(user_id: int) -> Dict:
-    if user_id not in user_states:
-        user_states[user_id] = {
-            "groups": [],
-            "active_group_id": None,
-            "active_questions": [],
-            "current_index": 0,
-            "score": 0,
-            "is_active": False,
-            "current_msg_id": None,
-            "answered": False,
-            # Draft rejim
-            "draft_questions": [],
-            "draft_name": None,
-            "is_drafting": False,
-        }
-    else:
-        state = user_states[user_id]
-        state.setdefault("groups", [])
-        state.setdefault("active_group_id", None)
-        state.setdefault("active_questions", [])
-        state.setdefault("current_index", 0)
-        state.setdefault("score", 0)
-        state.setdefault("is_active", False)
-        state.setdefault("current_msg_id", None)
-        state.setdefault("answered", False)
-        state.setdefault("draft_questions", [])
-        state.setdefault("draft_name", None)
-        state.setdefault("is_drafting", False)
-    return user_states[user_id]
-
-def next_group_id(state: Dict) -> int:
-    groups = state.get("groups", [])
-    if not groups:
-        return 1
-    return max(g["id"] for g in groups) + 1
 
 # ----------------------------------------------------------
 # 5. DASHBOARD & NAVIGATSIYA
@@ -249,7 +240,7 @@ DRAFT_MODE_TEXT = (
 )
 
 # ----------------------------------------------------------
-# 6. SHAXSIY QUIZ FUNKSIYALARI (MANUAL VA TAYMER BILAN)
+# 6. SHAXSIY QUIZ FUNKSIYALARI
 # ----------------------------------------------------------
 def build_question_message(state: Dict) -> tuple:
     idx = state["current_index"]
@@ -267,14 +258,11 @@ def build_question_message(state: Dict) -> tuple:
 
     keyboard = []
     for i, opt in enumerate(q["options"]):
-        keyboard.append([InlineKeyboardButton(
-            text=f"{chr(65+i)}) {opt}",
-            callback_data=f"ans_{i}"
-        )])
+        keyboard.append([InlineKeyboardButton(text=f"{chr(65+i)}) {opt}", callback_data=f"ans_{i}")])
 
     return text, InlineKeyboardMarkup(keyboard)
 
-async def send_question(chat_id: int, state: Dict, context: ContextTypes.DEFAULT_TYPE):
+async def send_question(chat_id: int, user_id: int, state: Dict, context: ContextTypes.DEFAULT_TYPE):
     text, markup = build_question_message(state)
     msg = await context.bot.send_message(
         chat_id=chat_id,
@@ -284,11 +272,11 @@ async def send_question(chat_id: int, state: Dict, context: ContextTypes.DEFAULT
     )
     state["current_msg_id"] = msg.message_id
     state["answered"] = False
-    save_data(user_states)
+    await save_user_state(user_id, state)
 
-async def finish_quiz(chat_id: int, state: Dict, context: ContextTypes.DEFAULT_TYPE):
+async def finish_quiz(chat_id: int, user_id: int, state: Dict, context: ContextTypes.DEFAULT_TYPE):
     state["is_active"] = False
-    save_data(user_states)
+    await save_user_state(user_id, state)
     score = state["score"]
     total = len(state["active_questions"])
     percent = int((score / total) * 100) if total > 0 else 0
@@ -344,7 +332,6 @@ async def send_group_question(chat_id: int, gqs: Dict, context: ContextTypes.DEF
     )
     gqs["current_msg_id"] = msg.message_id
 
-    # Agar vaqt rejimi taymerli bo'lsa (15s yoki 30s)
     if time_limit > 0:
         job_name = f"gq_timer_{chat_id}"
         for old_job in context.application.job_queue.get_jobs_by_name(job_name):
@@ -398,7 +385,6 @@ async def advance_group_question(chat_id: int, gqs: Dict, context: ContextTypes.
     else:
         result_lines.append("😔 Hech kim to'g'ri javob bermadi.")
 
-    # Agar "Javobdan keyin o'tish" (manual) rejimi bo'lsa, faqat quiz egasi bosa oladigan tugma qo'shamiz
     next_keyboard = None
     if gqs["time_limit"] == 0:
         next_keyboard = InlineKeyboardMarkup([[
@@ -412,7 +398,6 @@ async def advance_group_question(chat_id: int, gqs: Dict, context: ContextTypes.
         reply_markup=next_keyboard
     )
 
-    # Agar avtomatik taymerli rejim bo'lsa, 2 soniyadan keyin o'zi o'tadi
     if gqs["time_limit"] > 0:
         gqs["current_index"] += 1
         if gqs["current_index"] >= gqs["total"]:
@@ -457,7 +442,7 @@ async def finish_group_quiz(chat_id: int, gqs: Dict, context: ContextTypes.DEFAU
     group_quiz_states.pop(chat_id, None)
 
 # ----------------------------------------------------------
-# 8. HANDLERLAR (START, HELP, TEXT, CALLBACK)
+# 8. HANDLERLAR
 # ----------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -473,13 +458,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 author_id = int(parts[1])
                 group_id = int(parts[2])
-                author_state = user_states.get(author_id)
+                author_state = await get_user_state(author_id)
                 if author_state:
                     shared_group = next(
                         (g for g in author_state.get("groups", []) if g["id"] == group_id), None
                     )
                     if shared_group:
-                        state = get_user_state(user.id)
+                        state = await get_user_state(user.id)
                         new_id = next_group_id(state)
                         state["groups"].append({
                             "id": new_id,
@@ -487,7 +472,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             "questions": copy.deepcopy(shared_group["questions"]),
                             "time_limit": shared_group.get("time_limit", 30)
                         })
-                        save_data(user_states)
+                        await save_user_state(user.id, state)
                         keyboard = [[InlineKeyboardButton(
                             "🚀 Testni boshlash",
                             callback_data=f"startquiz:{new_id}"
@@ -516,7 +501,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 group_id = int(parts[2])
 
                 if update.effective_chat.type == "private":
-                    await update.message.reply_text("❌ Bu havola guruhda quiz o'tkazish uchun mo'ljallangan.")
+                    await update.message.reply_text("❌ Bu havola guruhda test o'tkazish uchun mo'ljallangan.")
                     return
 
                 if user.id != host_user_id:
@@ -527,13 +512,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("⚠️ Guruhda faol test ketmoqda.")
                     return
 
-                host_state = user_states.get(host_user_id)
+                host_state = await get_user_state(host_user_id)
                 group = next((g for g in host_state.get("groups", []) if g["id"] == group_id), None)
                 if not group:
                     await update.message.reply_text("❌ Test guruh topilmadi.")
                     return
 
-                # Vaqt rejimi testning o'zida saqlangan
                 time_limit = group.get("time_limit", 30)
                 questions = copy.deepcopy(group["questions"])
                 random.shuffle(questions)
@@ -588,17 +572,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = update.message.text.strip()
+    state = await get_user_state(user_id)
 
     # 1. Rename rejimi
     renaming_group_id = context.user_data.get("renaming_group_id")
     if renaming_group_id is not None:
         new_name = text[:64]
-        state = get_user_state(user_id)
         group = next((g for g in state.get("groups", []) if g["id"] == renaming_group_id), None)
         context.user_data.pop("renaming_group_id", None)
         if group:
             group["name"] = new_name
-            save_data(user_states)
+            await save_user_state(user_id, state)
             await update.message.reply_text(
                 f"✅ Guruh nomi muvaffaqiyatli o'zgartirildi:\n*{safe_md(new_name)}*",
                 parse_mode="Markdown",
@@ -613,7 +597,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 2. Test savollarini parse qilish
     new_questions = parse_text_to_questions(text)
-    state = get_user_state(user_id)
 
     if not new_questions:
         if state.get("is_drafting"):
@@ -635,7 +618,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Avtomatik draft rejimini yoqish (agar oldin yangi test deb bosilmagan bo'lsa)
     if not state.get("is_drafting"):
         state["draft_questions"] = []
         state["draft_name"] = None
@@ -643,7 +625,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state["draft_questions"].extend(new_questions)
     total_draft = len(state["draft_questions"])
-    save_data(user_states)
+    await save_user_state(user_id, state)
 
     await update.message.reply_text(
         f"📥 *{len(new_questions)} ta yangi savol qabul qilindi!*\n\n"
@@ -661,7 +643,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
 
-    # 1. Obuna bo'ldim tekshiruvi
     if data == "check_sub":
         is_subscribed = await check_subscription(user_id, context)
         if is_subscribed:
@@ -674,22 +655,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Kanalimizga a'zo bo'lmadingiz!", show_alert=True)
         return
 
-    # Boshqa tugmalarda ham qat'iy a'zolikni tekshirish
     if not await require_subscription(user_id, chat_id, context):
         return
 
-    # Dashboardga qaytish
     if data == "dash_main":
         await show_dashboard(update, context, edit_message=True)
         return
 
-    # Yangi test yaratishni boshlash
     if data == "dash_new":
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         state["draft_questions"] = []
         state["draft_name"] = None
         state["is_drafting"] = True
-        save_data(user_states)
+        await save_user_state(user_id, state)
         await query.message.edit_text(
             DRAFT_MODE_TEXT + EXAMPLE_FORMAT,
             parse_mode="Markdown",
@@ -697,9 +675,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Mening quizlarim ro'yxati
     if data == "dash_myquizzes":
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         groups = state.get("groups", [])
         if not groups:
             await query.message.edit_text(
@@ -725,10 +702,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Quiz boshqaruvi
     if data.startswith("dash_quiz:"):
         group_id = int(data.split(":")[1])
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         group = next((g for g in state["groups"] if g["id"] == group_id), None)
         if not group:
             await query.answer("❌ Test guruh topilmadi.", show_alert=True)
@@ -756,12 +732,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # O'chirish
     if data.startswith("dash_del:"):
         group_id = int(data.split(":")[1])
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         state["groups"] = [g for g in state["groups"] if g["id"] != group_id]
-        save_data(user_states)
+        await save_user_state(user_id, state)
         await query.answer("🗑 Test guruhi o'chirildi!")
         await query.message.edit_text(
             "✅ O'chirildi.",
@@ -769,7 +744,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Guruh nomini o'zgartirish
     if data.startswith("rename_group:"):
         group_id = int(data.split(":")[1])
         context.user_data["renaming_group_id"] = group_id
@@ -780,13 +754,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Draft: Bekor qilish
     if data == "draft_cancel":
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         state["draft_questions"] = []
         state["draft_name"] = None
         state["is_drafting"] = False
-        save_data(user_states)
+        await save_user_state(user_id, state)
         await query.answer("🗑 Draft bekor qilindi.")
         await query.message.edit_text(
             "🗑 Barcha vaqtinchalik savollar o'chirildi va bekor qilindi.",
@@ -794,9 +767,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Draft: Saqlash tugmasi bosildi (Vaqt sozlash so'raladi)
     if data == "draft_confirm_save":
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         if not state.get("draft_questions"):
             await query.answer("⚠️ Avval savollarni yuboring!", show_alert=True)
             return
@@ -816,10 +788,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Draft: Vaqt sozlamasi tanlanib test saqlanmoqda
     if data.startswith("save_mode:"):
         time_limit = int(data.split(":")[1])
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         draft_qs = state.get("draft_questions", [])
 
         if not draft_qs:
@@ -837,14 +808,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         state["groups"].append(new_group)
 
-        # Draftni tozalaymiz
         state["draft_questions"] = []
         state["draft_name"] = None
         state["is_drafting"] = False
-        save_data(user_states)
+        await save_user_state(user_id, state)
 
         time_display = "Javobdan so'ng (Manual)" if time_limit == 0 else f"{time_limit} soniya"
-        
         bot_me = await context.bot.get_me()
         startgroup_url = f"https://t.me/{bot_me.username}?startgroup=startquiz_{user_id}_{new_id}"
         
@@ -865,9 +834,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Shaxsiy testda javob berish
     if data.startswith("ans_"):
-        state = user_states.get(user_id)
+        state = await get_user_state(user_id)
         if not state or not state.get("is_active"):
             return
         if state.get("answered"):
@@ -889,7 +857,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             result_text = f"❌ *Noto'g'ri!* To'g'ri javob: *{letters[correct]}) {q['options'][correct]}*"
 
-        # Tugmalarni holatini yangilash
         new_keyboard = []
         for i, opt in enumerate(q["options"]):
             icon = "✅" if i == correct else "❌" if i == chosen else "◾"
@@ -901,46 +868,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         state["current_index"] += 1
-        save_data(user_states)
+        await save_user_state(user_id, state)
 
-        # Test tugadi
         if state["current_index"] >= total:
             await query.message.reply_text(result_text, parse_mode="Markdown")
-            await finish_quiz(chat_id, state, context)
+            await finish_quiz(chat_id, user_id, state, context)
             return
 
-        # Guruh sozlamalarini tekshiramiz
         group_id = state.get("active_group_id")
         group = next((g for g in state.get("groups", []) if g["id"] == group_id), None)
         time_limit = group.get("time_limit", 30) if group else 30
 
         if time_limit == 0:
-            # Manual o'tish (Javobdan keyin o'tish rejimi)
             await query.message.reply_text(
                 result_text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➡️ Keyingi savol", callback_data="nextq")]])
             )
         else:
-            # Taymerli bo'lsa shaxsiy chatda ham tezkorlik uchun darhol 1.5 soniyada keyingisiga o'tkazadi
             await query.message.reply_text(result_text, parse_mode="Markdown")
             await asyncio.sleep(1.5)
-            await send_question(chat_id, state, context)
+            await send_question(chat_id, user_id, state, context)
         return
 
-    # Shaxsiy testda keyingi savol
     if data == "nextq":
-        state = user_states.get(user_id)
+        state = await get_user_state(user_id)
         if not state or not state.get("is_active"):
             return
         try:
             await query.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await send_question(chat_id, state, context)
+        await send_question(chat_id, user_id, state, context)
         return
 
-    # Guruhda javob berish
     if data.startswith("gq_ans_"):
         chosen = int(data.split("_")[2])
         gqs = group_quiz_states.get(chat_id)
@@ -972,7 +933,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer(f"❌ Noto'g'ri! (To'g'ri: {['A','B','C','D'][correct]})", show_alert=False)
 
-        # Agar guruhda hamma javob berib bo'lgan bo'lsa (ishtirokchilar soni > 1 va hamma javob bergan bo'lsa)
         if len(gqs["participants"]) > 1 and all(px.get("answered") for px in gqs["participants"].values()):
             if gqs["time_limit"] > 0:
                 job_name = f"gq_timer_{chat_id}"
@@ -981,7 +941,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await advance_group_question(chat_id, gqs, context)
         return
 
-    # Guruhda manual keyingi savolga o'tish (Faqat test egasi uchun)
     if data.startswith("gq_manual_next:"):
         host_user_id = int(data.split(":")[1])
         if user_id != host_user_id:
@@ -1004,7 +963,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_group_question(chat_id, gqs, context)
         return
 
-    # Ulashish havolasini taqdim etish
     if data.startswith("share:"):
         group_id = int(data.split(":")[1])
         bot_me = await context.bot.get_me()
@@ -1023,10 +981,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"Havola: {share_link}")
         return
 
-    # Shaxsiy quizni boshlash
     if data.startswith("startquiz:"):
         group_id = int(data.split(":")[1])
-        state = get_user_state(user_id)
+        state = await get_user_state(user_id)
         group = next((g for g in state["groups"] if g["id"] == group_id), None)
         if not group or not group.get("questions"):
             await query.message.reply_text("❌ Savollar topilmadi.")
@@ -1047,7 +1004,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state["is_active"] = True
         state["current_msg_id"] = None
         state["answered"] = False
-        save_data(user_states)
+        await save_user_state(user_id, state)
 
         await query.message.reply_text(
             f"🚀 *{safe_md(group['name'])}* boshlandi!\n\n"
@@ -1055,7 +1012,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Omad tilaymiz!",
             parse_mode="Markdown"
         )
-        await send_question(chat_id, state, context)
+        await send_question(chat_id, user_id, state, context)
         return
 
     if data == "done":
@@ -1084,7 +1041,7 @@ class DummyHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Light Bot 2.0 is running perfectly!")
+        self.wfile.write(b"Light Bot 2.0 with MongoDB is running perfectly!")
 
     def log_message(self, format, *args):
         pass
@@ -1103,12 +1060,10 @@ def main():
         logger.error("BOT_TOKEN topilmadi! .env faylini tekshiring.")
         return
 
-    # Render porti uchun dummy serverni fonda ochamiz
     threading.Thread(target=run_dummy_server, daemon=True).start()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Job queue orqali keep-alive pingni 10 daqiqada (600 soniyada) ishlatamiz
     if app.job_queue:
         app.job_queue.run_repeating(keep_alive_ping, interval=600, first=10)
 
@@ -1120,7 +1075,7 @@ def main():
     ))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("🚀 Light Bot 2.0 muvaffaqiyatli ishga tushdi!")
+    logger.info("🚀 Light Bot 2.0 (MongoDB) muvaffaqiyatli ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
