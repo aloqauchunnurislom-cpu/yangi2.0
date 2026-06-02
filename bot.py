@@ -1007,14 +1007,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ulashish havolasini taqdim etish
     if data.startswith("share:"):
         group_id = int(data.split(":")[1])
-        bot_username = context.bot.username
+        bot_me = await context.bot.get_me()
+        bot_username = bot_me.username
         share_link = f"https://t.me/{bot_username}?start=share-{user_id}-{group_id}"
-        await query.message.reply_text(
-            f"🔗 *Ushbu test guruhining ulashish havolasi:*\n\n`{share_link}`\n\n"
-            "Havolani nusxalash uchun ustiga bosing va do'stlaringizga yuboring.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=f"dash_quiz:{group_id}")]])
-        )
+        
+        try:
+            await query.message.edit_text(
+                f"🔗 *Ushbu test guruhining ulashish havolasi:*\n\n`{share_link}`\n\n"
+                "Havolani nusxalash uchun ustiga bosing va do'stlaringizga yuboring.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=f"dash_quiz:{group_id}")]])
+            )
+        except Exception as e:
+            logger.error(f"Share link error: {e}")
+            await query.message.reply_text(f"Havola: {share_link}")
         return
 
     # Shaxsiy quizni boshlash
