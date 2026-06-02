@@ -487,9 +487,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             reply_markup=InlineKeyboardMarkup(keyboard)
                         )
                         return
-            except Exception:
-                pass
-        await update.message.reply_text("❌ Ulashilgan test havolasi yaroqsiz.")
+            except Exception as e:
+                logger.error(f"Share error: {e}")
+                
+        # Qo'shimcha debug ma'lumoti
+        debug_info = "Noma'lum sabab"
+        try:
+            author_id = int(args[0].split("-")[1])
+            group_id = int(args[0].split("-")[2])
+            st = await get_user_state(author_id)
+            if not st:
+                debug_info = "Muallif topilmadi"
+            else:
+                grps = st.get('groups', [])
+                debug_info = f"Guruhlar soni: {len(grps)}. Qidirilmoqda: {group_id}"
+        except Exception:
+            pass
+            
+        await update.message.reply_text(f"❌ Ulashilgan test havolasi yaroqsiz.\n(Debug: {debug_info})")
         return
 
     # Deep link: guruhda quiz boshlash
@@ -971,14 +986,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             await query.message.edit_text(
-                f"🔗 *Ushbu test guruhining ulashish havolasi:*\n\n`{share_link}`\n\n"
-                "Havolani nusxalash uchun ustiga bosing va do'stlaringizga yuboring.",
+                f"🔗 *Ushbu test guruhining ulashish havolasi:*\n\n{share_link}\n\n"
+                "Do'stlaringizga yuborish uchun havolani nusxalang yoki to'g'ridan-to'g'ri Forward (Ulashish) qiling.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=f"dash_quiz:{group_id}")]])
             )
         except Exception as e:
             logger.error(f"Share link error: {e}")
-            await query.message.reply_text(f"Havola: {share_link}")
+            await query.message.reply_text(f"Havola:\n{share_link}")
         return
 
     if data.startswith("startquiz:"):
