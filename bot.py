@@ -80,11 +80,11 @@ group_quiz_states: Dict[int, Any] = {}  # chat_id -> guruh quiz holati
 # 2. REGEX (Kuchaytirilgan parser)
 # ----------------------------------------------------------
 QUESTION_REGEX = re.compile(
-    r"(?P<num>\d+)[.)]\s*(?P<question>[^\n]+)\n"
-    r"\s*A[.)]\s*(?P<a>[^\n]+)\n"
-    r"\s*B[.)]\s*(?P<b>[^\n]+)\n"
-    r"\s*C[.)]\s*(?P<c>[^\n]+)\n"
-    r"\s*D[.)]\s*(?P<d>[^\n]+)\n"
+    r"(?P<num>\d+)[.)]\s*(?P<question>[^\n]+)\n+"
+    r"\s*A[.)]\s*(?P<a>[^\n]+)\n+"
+    r"\s*B[.)]\s*(?P<b>[^\n]+)\n+"
+    r"\s*C[.)]\s*(?P<c>[^\n]+)\n+"
+    r"\s*D[.)]\s*(?P<d>[^\n]+)\n+"
     r"\s*Javob:\s*(?P<ans>[A-Da-d])",
     re.IGNORECASE | re.MULTILINE
 )
@@ -844,6 +844,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_data(user_states)
 
         time_display = "Javobdan so'ng (Manual)" if time_limit == 0 else f"{time_limit} soniya"
+        
+        bot_me = await context.bot.get_me()
+        startgroup_url = f"https://t.me/{bot_me.username}?startgroup=startquiz_{user_id}_{new_id}"
+        
         await query.message.edit_text(
             f"✅ *Test guruhi muvaffaqiyatli yaratildi!*\n\n"
             f"📁 Guruh nomi: *{safe_md(draft_name)}*\n"
@@ -852,6 +856,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Uni shaxsiy yoki telegram guruhlarda boshlashingiz mumkin.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 Shaxsiyda boshlash", callback_data=f"startquiz:{new_id}")],
+                [InlineKeyboardButton("👥 Guruhda boshlash", url=startgroup_url)],
                 [InlineKeyboardButton("✏️ Nomini o'zgartirish", callback_data=f"rename_group:{new_id}")],
                 [InlineKeyboardButton("⚙️ Testni boshqarish", callback_data=f"dash_quiz:{new_id}")],
                 [InlineKeyboardButton("⬅️ Bosh menyu", callback_data="dash_main")]
